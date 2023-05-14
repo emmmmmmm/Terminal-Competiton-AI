@@ -1,3 +1,4 @@
+from gamelib import debug_write
 from em_player import Player
 from em_timer import Timer
 from em_gameGrid import GameGrid
@@ -6,51 +7,62 @@ from em_util import BuildQueue
 import em_util
 import em_log as debug
 from em_strategy import Strategy
-import gamelib
-from gamelib import debug_write
-import random
-import copy
 import em_buildingPlans as BuildingPlans
-import em_pathing as Pathing
-# import em_pathing
+from em_scoring import Scoring
+from copy import deepcopy
+import queue
+
+"""-------------------------------------------------------------
+
+# TODO:
+
+- rethink scoring: how to use health? lower the score of low-health units?
+- also: for health-scores: don't consider filters!
+- also: when spawning EMPs: search for pathes that will do high damage, but w/ low score! (-> few destructors)
+
+
+-------------------------------------------------------------"""
+
 #------------------------------------------------------------------
 # THE BRAIN CLASS!!
 #------------------------------------------------------------------
 
-
 class Brain:
     def __init__(self):
-        debug.ACTIVE = False
+        debug.ACTIVE = True
         self.timer = Timer()
         self.log = []
 
+
         self.history = []
-        self.hits = [] #set from on_action
+        self.hits = []  #set from on_action
         self.damage = [] #set from on_action
         self.game_state = []  #set from update
-        self.enemyUnits = [] # set from on_action
+        self.enemyUnits = [] #set from on_action
         self.playerUnits = [] #set from on_action
 
+        self.enemyHealth = 0
+        self.playerHealth= 0
         self.playerScores = []
         self.enemyScores = []
-        self.enemyHealth = 30
-        self.playerHealth= 30
 
         # is anything here still in use?? - don't think so.
         self.enemySpawnPoints = []
         self.enemyHitPoints = []
-        self.enemyPaths = []
-        self.playerPaths = []
-        self.spawn = []
+        self.enemyPaths = [] # unused
+        self.playerPaths = [] # unused
+        self.spawn = [] # unused
 
         self.enemyEdgePoints = [] # set on setup
         self.playerEdgePoints = []# set on setup
 
-        self.enemyScored = False
-        self.playerScored = False
+        self.enemyScored = False  # unused
+        self.playerScored = False # unused
+
+        self.buildQueue = BuildQueue()
 
 
-
+        self.tasks = queue.Queue()
     #------------------------------------------------------------------
     def start(self,game_state):
         self.game_state = game_state
@@ -62,42 +74,43 @@ class Brain:
 
         self.player = Player(playerIndex=0, game_state = game_state)
         self.enemy  = Player(playerIndex=1, game_state = game_state)
-
+        self.playerHealth = game_state.my_health
+        self.enemyHealth = game_state.enemy_health
+        self.scoring = Scoring(game_state)
         self.strategy = Strategy(game_state,self.player,self.enemy,self)
-        self.buildQueue = BuildQueue()
+
         debug.print("-------------------------------")
         debug.print(" init done - ready for action! ")
         debug.print("-------------------------------")
     #------------------------------------------------------------------
     def update(self,game_state):
-        debug.print("")
-        debug.print(" ===== turn {}  ===== ".format(game_state.turn_number))
-        debug.print("")
+        debug.print(".   ------------------------------------------------------------------------------------------")
+        debug.print(".              ========== turn {}  ========== ".format(game_state.turn_number))
+        debug.print(".   ------------------------------------------------------------------------------------------")
         game_state.suppress_warnings(True) # do I need to re-set this every turn?
-
         self.timer.reset()
         self.game_state = game_state
 
         # analyze what happend last turn:
         self.analyzeActionPhase()
 
-        if self.GridChanged(): # this could speed things up by quite a bit!
-            self.playerScores = Pathing.GetScores(self.player, self.gameGrid,self.game_state, optimized = True)
-            self.enemyScores  = Pathing.GetScores(self.enemy, self.gameGrid,self.game_state, optimized = False)
-
+        #if self.GridChanged(): # this could speed things up by quite a bit!
+        self.playerScores = self.scoring.GetScores(self.player, self.gameGrid,self.game_state, optimized = True, threading = False)
+        self.enemyScores  = self.scoring.GetScores(self.enemy, self.gameGrid,self.game_state, optimized = False, threading = False)
+        
         debug.print("Getting all scores took {:.2f} seconds".format(self.timer.timePassed()))
-
-        # print map to console
-        #debug.print_scores(self.playerScores)
+        #debug.print_values_dict(self.gameGrid.getUnitMap(),self.game_state.game_map,scaling=False )
 
         # update players
         self.player.Update(self.playerUnits[-1] if self.playerUnits else [],
                            self.game_state,
                            self.playerScores)
+
         self.enemy.Update(self.enemyUnits[-1] if self.enemyUnits else [],
                           self.game_state,
-                         self.enemyScores)
+                          self.enemyScores)
 
+    
         # all info is gathered, build strategy!
         self.createStrategy()
 
@@ -112,63 +125,101 @@ class Brain:
 
     #------------------------------------------------------------------
     def createStrategy(self):
-        #funcs
-        spawnUnits = self.game_state.attempt_spawn
-        deleteUnits = self.game_state.attempt_remove
+
         # update strategy base values
-        self.strategy.reset(self.game_state,self.player,self.enemy)
+        self.strategy.reset(self.game_state,
+                            self.player,
+                            self.enemy,
+                            self.gameGrid)
         # look at bestScore, and the best health score, and see if there's a point in sending pings!
         healthScores = self.GetScoresByHealth(self.player.index)
-
-        # don't spawn too many encryptors...
-        # TODO: move this someplace else? ... Strategy comes to mind for example
-        self.strategy.spawnEncryptors = True
-        encs = len(self.gameGrid.getUnitsOfType(self.game_state.ENCRYPTOR,self.player.index))
-        #self.print("Player has {} encryptors on the field".format(encs))
-        if encs > 5:
-            self.strategy.spawnEncryptors = False
-
-        # create strategy for this turn:
-        currentStrategy = "adaptive"
-        side = None
-        playerThreatLevel = self.player.ThreatLevel(attackCost = 10) # default attack
+        
+        # threatlevels (ratio of score/bits)
+        playerThreatLevel = self.player.ThreatLevel(10) 
         enemyThreatLevel = self.enemy.ThreatLevel()
+
 
         # debug print for balancing:
         debug.print("PLAYER: Cores: {} Bits: {}".format(self.player.cores, self.player.bits))
         debug.print("ENEMY : Cores: {} Bits: {}".format(self.enemy.cores, self.enemy.bits))
-        debug.print("SCORE: {:.2f} / HEALTH: {}".format(self.player.bestScore.value, healthScores[0].health))
+        #debug.print("SCORE: {:.2f} / HEALTH: {}".format(self.player.bestScore.value, healthScores[0].health))
         #debug.print("Value Near Spawn: {}".format(self.player.bestScore.valueNearSpawn))
-        debug.print("THREAT: player: {:.2f} (score: {:.2f})".format(playerThreatLevel,self.player.bestScore.value))
-        debug.print("THREAT: enemy:  {:.2f} (score: {:.2f})".format(enemyThreatLevel,self.enemy.bestScore.value))
+        if self.player.bestScore and self.enemy.bestScore:
+            debug.print("THREAT: player: {:.2f} (score: {:.2f} / {} - {})".format(playerThreatLevel,self.player.bestScore.value, self.player.bestScore.health, self.player.bestScore.startPoint))
+            debug.print("THREAT: enemy:  {:.2f} (score: {:.2f} / {} - {})".format(enemyThreatLevel,self.enemy.bestScore.value, self.enemy.bestScore.health,self.enemy.bestScore.startPoint))
+        
+        #for score in self.enemy.scores:
+        #    self.print("{} -> {}, {} // {}".format(score.startPoint,score.endPoint, score.value,len(score.units)))
+            #for u in score.units:
+            #    self.print("{}: {} {}".format(u.playerIndex, u.pos, u.type))
+
+            debug.print("pathToEnd: {}".format(self.player.bestScore.pathToEnd))
+            debug.print(" {} / {}".format(len(self.player.scores), len(healthScores)))
 
 
+        """
+        now i know:
+        - the worst attack my enemy could do
+        - how many units he could spawn
+        - which type is most likely to spawn
+        """
+
+        # how to figure out if its better to build defense or to wait?
+
+    
+
+
+        # create strategy for this turn:
+        currentStrategy = "adaptive"
+        side = None
 
 
         # first turns
         if self.game_state.turn_number<2:
-            #side = "left"
             currentStrategy = "maze"
-            self.strategy.AddUnits(self.game_state.PING,10,self.player.bestScore.startPoint)
-
+            self.strategy.AddUnits(self.game_state.PING, 10, self.player.bestScore.startPoint)
+        elif self.player.bestScore == None:
+            # no scores found!? - use cannon to clear a way!
+            side = self.player.CanSpawnCannon(self.gameGrid,self.enemy) # "left"/"right"/False
+            if side:
+               
+                currentStrategy = "pingCannon"
+                self.strategy.AddUnits(self.game_state.PING,19,BuildingPlans.GetPingCannonSpawn(side)) 
+            else:
+                pass
+                #self.strategy.AddUnits(self.game_state.EMP,5,self.player.bestScore.startPoint)
         # if self destructing
         elif not self.player.bestScore.pathToEnd:
             # check if i should build a cannon
             # i'm kinda safe here, so dont worry if it takes a couple of turns
             side = self.player.CanSpawnCannon(self.gameGrid,self.enemy) # "left"/"right"/False
-            if side:
+            if side and not self.enemy.AttacksCorner():
                 currentStrategy = "pingCannon"
-                self.strategy.AddUnits(self.game_state.PING,19,BuildingPlans.GetPingCannonSpawn(side)) # spwn will be overwritten
+                self.strategy.AddUnits(self.game_state.PING,19,BuildingPlans.GetPingCannonSpawn(side)) 
             else:
-                currentStrategy = "adaptive" # no need to re-set this
-                self.strategy.AddUnits(self.game_state.PING,19,self.player.bestScore.startPoint)
+                # find path with least opposition near the end - is this smart? idk^^
+                #self.player.scores.sort(key = lambda x: x.valueNearBreach) # does this work?
+                self.strategy.AddUnits(self.game_state.EMP,5,self.player.bestScore.startPoint)
+                # maybe do EMPs here instead? hmm....... 
+                # how would I decide if emps are better than pings? -> health around endpoint -> TODO
+        
 
-        # VALUE: adjust maximum thresholds
-        elif playerThreatLevel < 1 or healthScores[0].health < 200: # VALUE # should score w/ default attack:
+        elif self.player.CanSpawnCannon(self.gameGrid, self.enemy, maxDefense = 0) and self.player.cores > 10: # "free ping cannon" - this /could/ be good? # TODO
+            self.print("# discount pingcannon...")
+            side = self.player.CanSpawnCannon(self.gameGrid,self.enemy) # "left"/"right"/False
+            currentStrategy = "pingCannon"
+            self.strategy.AddUnits(self.game_state.PING,19,BuildingPlans.GetPingCannonSpawn(side)) 
+
+
+        elif playerThreatLevel < 0.8 or healthScores[0].health < 100: # VALUE # should score w/ default attack:
             self.strategy.AddUnits(self.game_state.PING,10,self.player.bestScore.startPoint)
+        elif playerThreatLevel < 1.1 or healthScores[0].health < 500: # TODO test this
+            self.strategy.AddUnits(self.game_state.EMP,3,self.player.bestScore.startPoint)
+       
         else: # playerThreatLevel >= 1
-
-            if self.player.ThreatLevel(attackCost = 19) < 1: # bigger attack might score
+            if self.player.ThreatLevel(attackCost = 15) < 0.8: # bigger attack might score
+                self.strategy.AddUnits(self.game_state.PING,15,self.player.bestScore.startPoint)
+            elif self.player.ThreatLevel(attackCost = 19) < 0.8: # bigger attack might score
                 self.strategy.AddUnits(self.game_state.PING,19,self.player.bestScore.startPoint)
             else:
                 side = self.player.CanSpawnCannon(self.gameGrid,self.enemy)
@@ -179,31 +230,35 @@ class Brain:
                     # well fuck^^
                     # impenetrable defense and not able to build a cannon... what to do now?
                     currentStrategy = "maze"
-                    self.strategy.AddUnits(self.game_state.EMP,5,BuildingPlans.GetMazeSpawn())
+                    self.strategy.AddUnits(self.game_state.EMP,5,BuildingPlans.GetMazeSpawn()) #"bruteforce" xD
+                    # are there other times when a maze would be a good idea?
+                    # - if the enemy is pingrushing and i have lot's of cores
+                    # - ???
 
 
-        self.strategy.SetCurrentStrategy(currentStrategy, side, enemyThreatLevel)
 
-        # sheduled reconstruction:
-        # TODO: think about this?
-        self.buildQueue.process(self.game_state,self.strategy.notBuildAllowed)
+
+        self.strategy.SetCurrentStrategy(currentStrategy, side, enemyThreatLevel,playerThreatLevel)
+
+        
+        
 
 
 
         self.strategy.CreateOffense()
         self.strategy.CreateDefense()
 
+        # sheduled reconstruction:
+        self.buildQueue.process(self.game_state,self.strategy.notBuildAllowed)
+
+        #deploy units
         self.strategy.DeployDefense()
         self.strategy.DeployOffense()
 
 
 
         # TODO: OOOhhh I could use the unusedUnits to figure out if i can replace some destructors with filters!
-        # still won't work, bc/ then i'd delete part of my maze on future turns... -,-
-        #if self.game_state.turn_number > 10 and currentStrategy == "maze":
-        #    self.RemoveUnusedUnits()
-
-
+     
         # add critical units to queue to be replaced!
         # TODO: think about when this is a good strategy..!
         # maybe only do this for units that are in/near my enemys best path?
@@ -211,7 +266,7 @@ class Brain:
 
 
         if unitsToRebuild:
-            deleteUnits(locsToRebuild)
+            self.game_state.attempt_remove(locsToRebuild)
             self.buildQueue.push(unitsToRebuild)
 
     #------------------------------------------------------------------
@@ -221,56 +276,36 @@ class Brain:
             unitsToRebuild = [unit for unit in unitsToRebuild if unit.type is not self.game_state.ENCRYPTOR]
 
         locs = [unit.pos for unit in unitsToRebuild]
-        type = [[unit.type, unit.pos] for unit in unitsToRebuild]
+        units = [[unit.type, unit.pos] for unit in unitsToRebuild]
 
-        return locs, type
+        return locs, units
     #------------------------------------------------------------------
     def RemoveUnusedUnits(self):
         # Remove unused units -> figure out WHEN this is apropriate...!
         unused = self.gameGrid.getUnusedUnits(self.player.index)
         locs = [p.pos for p in unused if p.type != self.game_state.ENCRYPTOR]
         if locs:
-            deleteUnits(locs)
+            self.game_state.attempt_remove(locs)
 
     #------------------------------------------------------------------
     def analyzeActionPhase(self):
         # update history
-        currentPlayer0InfoUnits = []
-        currentPlayer1InfoUnits = []
         game_state = self.game_state
         map = game_state.game_map
-        allLocations = map.get_all_locations
         allUnits = map.get_all_units
 
-        currentUnits = allUnits()
-
-        currentPlayer0InfoUnits = [unit for unit in currentUnits if not(unit.stationary ) and unit.player_index == 0]
-        currentPlayer1InfoUnits = [unit for unit in currentUnits if not(unit.stationary ) and unit.player_index == 1]
-
-
-        self.history.append(currentUnits) # could be used to predict if a unit well be rebuilt (and their order of rebuilding etc...)!
-
-
+        currentUnits = [u for u in allUnits() if u.stationary]
+        self.history.append([u for u in currentUnits if not u.pending_removal]) # could be used to predict if a unit well be rebuilt (and their order of rebuilding etc...)!
 
         # update the map:
         # replace destroyed enemy units
         self.game_state = em_util.replaceDeletedEnemyUnits(game_state,self.history)
 
         # do not consider enemy units that are marked for deletion
-
-        """
-        for location in allLocations():
-            if not map[location]:
-                continue
-            if map[location][0].pending_removal:
-                map.remove_unit(location)
-        """
-        # this should work, no?
-        for unit in currentUnits:
-            if unit.pending_removal:
-                self.print("removing unit {} bc marked for deletion".format(unit.pos))
-                map.remove_unit(unit.pos)
-
+        unitsToRemove = [u for u in currentUnits if u.pending_removal]
+        for unit in unitsToRemove:
+            self.print("removing unit {} bc marked for deletion".format(unit.pos))
+            map.remove_unit(unit.pos)
 
         # process previous ActionState:
         # check if someone scored -> to be used laters
@@ -288,23 +323,35 @@ class Brain:
 
         # update gameGrid
         self.gameGrid.update(game_state.game_map)
+        self.print("... analysis of previous turn done, everything up2date!")
         return
     #------------------------------------------------------------------
     def GridChanged(self):
         if(len(self.history)>1):
-            changed = [x for x in self.history[-1] if x not in self.history[-2]] # those are only units added, not units removed...
-            changed += [x for x in self.history[-2] if x not in self.history[-1]]
-            return len(changed)>0
-            #return set(tuple(self.history[-1])) == set(tuple(self.history[-2])) # slow??
-        return True #
-    #------------------------------------------------------------------
-    def dumpLog(self):
-        debug.dumpLog()
+
+            pos1 = [tuple(unit.pos) for unit in self.history[-1] if unit.stationary]
+            pos2 = [tuple(unit.pos) for unit in self.history[-2] if unit.stationary]
+            # return true if element is only in one of those lists
+            self.print("CHANGE: {}".format(len(set(pos1).symmetric_difference(pos2)) > 0))
+            # could use any() here, right? : )
+            return len(set(pos1).symmetric_difference(pos2)) > 0
+        return True
+
+
+            #changed =  [x for x in self.history[-1] if x not in self.history[-2]] # those are only units added, not units removed...
+            #changed += [x for x in self.history[-2] if x not in self.history[-1]]
+            #return len(changed)>0
+
+        #return True #
     #------------------------------------------------------------------
     def GetScoresByHealth(self, playerIndex):
-        healthScores = self.player.scores[:] # copy, just to make sure
-        healthScores.sort(key = lambda x: x.health, reverse = False) # sort by Score -> lowest first
+        healthScores = deepcopy(self.player.scores) # "SLOW", also ... needed?
+        healthScores.sort(key = lambda x: x.health, reverse = False) # sort by Health -> lowest first
         return healthScores
     #------------------------------------------------------------------
     def print(self,msg):
         debug.print(msg)
+    #------------------------------------------------------------------
+    def dumpLog(self):
+        debug.dumpLog()
+    #------------------------------------------------------------------
